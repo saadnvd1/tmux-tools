@@ -9,6 +9,8 @@ MODEL="${TMUX_TOOLS_MODEL:-${TMUX_NAMER_MODEL:-gemma3:12b}}"
 DRY_RUN=false
 TARGET_SESSION=""
 SKIP_ATTACHED=false
+REGENERATE=false
+CACHE_DIR="${HOME}/.cache/tmux-tools/summaries"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -73,6 +75,7 @@ Commands:
 Options:
   -d, --dry-run        (name) Show proposed names without renaming
   -s, --skip-attached  Skip the currently attached session
+  -r, --regenerate     (summarize) Regenerate summaries, ignoring cache
   -m, --model MODEL    Ollama model to use (default: gemma3:12b)
   -h, --help           Show this help
 
@@ -80,8 +83,9 @@ Examples:
   tmux-tools name                   # rename all sessions
   tmux-tools name -d                # preview names without renaming
   tmux-tools name my-session        # rename one session
-  tmux-tools summarize              # summarize all sessions
-  tmux-tools summarize my-session   # summarize one session
+  tmux-tools summarize              # summarize all sessions (cached)
+  tmux-tools summarize -r           # regenerate all summaries
+  tmux-tools summarize my-session   # summarize one session (cached)
   tmux-tools kill sess1 sess2       # kill specific sessions
   tmux-tools list                   # list all sessions
 EOF
@@ -168,6 +172,29 @@ cmd_name() {
   echo "Done."
 }
 
+# ── summary cache ────────────────────────────────────────────────────────────
+
+cache_path() {
+  local session="$1"
+  echo "${CACHE_DIR}/${session}"
+}
+
+get_cached_summary() {
+  local file
+  file=$(cache_path "$1")
+  if [[ -f "$file" ]]; then
+    cat "$file"
+    return 0
+  fi
+  return 1
+}
+
+save_summary_cache() {
+  local session="$1" summary="$2"
+  mkdir -p "$CACHE_DIR"
+  echo "$summary" > "$(cache_path "$session")"
+}
+
 # ── summarize command ────────────────────────────────────────────────────────
 
 generate_summary() {
@@ -194,7 +221,6 @@ $context"
 
 cmd_summarize() {
   check_tmux
-  check_ollama
 
   mapfile -t sessions < <(get_sessions)
   if [[ ${#sessions[@]} -eq 0 ]]; then
@@ -205,18 +231,53 @@ cmd_summarize() {
   local attached_session
   attached_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
 
+  local needs_generation=false
+  if [[ "$REGENERATE" == true ]]; then
+    needs_generation=true
+  else
+    for session in "${sessions[@]}"; do
+      if [[ "$SKIP_ATTACHED" == true && "$session" == "$attached_session" ]]; then
+        continue
+      fi
+      if ! get_cached_summary "$session" &>/dev/null; then
+        needs_generation=true
+        break
+      fi
+    done
+  fi
+
+  if [[ "$needs_generation" == true ]]; then
+    check_ollama
+    [[ "$REGENERATE" == true ]] && echo "Regenerating summaries..."
+  fi
+
   echo ""
-  echo "Summarizing ${#sessions[@]} session(s) using $MODEL..."
-  echo ""
+
+  local generated=0 cached=0
 
   for session in "${sessions[@]}"; do
     if [[ "$SKIP_ATTACHED" == true && "$session" == "$attached_session" ]]; then
       continue
     fi
 
-    local context summary
-    context=$(get_session_context "$session" 50)
-    summary=$(generate_summary "$session" "$context") || true
+    local summary=""
+
+    if [[ "$REGENERATE" != true ]]; then
+      summary=$(get_cached_summary "$session" 2>/dev/null) || true
+      if [[ -n "$summary" ]]; then
+        cached=$((cached + 1))
+      fi
+    fi
+
+    if [[ -z "$summary" ]]; then
+      local context
+      context=$(get_session_context "$session" 50)
+      summary=$(generate_summary "$session" "$context") || true
+      if [[ -n "$summary" ]]; then
+        save_summary_cache "$session" "$summary"
+        generated=$((generated + 1))
+      fi
+    fi
 
     if [[ -z "$summary" ]]; then
       printf "%-30s  (couldn't summarize)\n" "$session"
@@ -226,7 +287,7 @@ cmd_summarize() {
     fi
   done
 
-  echo "Done."
+  echo "Done. ($generated generated, $cached cached)"
 }
 
 # ── kill command ─────────────────────────────────────────────────────────────
@@ -274,6 +335,7 @@ KILL_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -d|--dry-run) DRY_RUN=true; shift ;;
+    -r|--regenerate) REGENERATE=true; shift ;;
     -s|--skip-attached) SKIP_ATTACHED=true; shift ;;
     -m|--model) MODEL="$2"; shift 2 ;;
     -h|--help) usage ;;
