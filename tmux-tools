@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# tmux-tools — AI-powered tmux session management
+# Subcommands: name, summarize, kill, list
+# Uses local Ollama for AI features
+
+set -euo pipefail
+
+MODEL="${TMUX_TOOLS_MODEL:-${TMUX_NAMER_MODEL:-gemma3:12b}}"
+DRY_RUN=false
+TARGET_SESSION=""
+SKIP_ATTACHED=false
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+check_tmux() {
+  if ! command -v tmux &>/dev/null; then
+    echo "tmux not found"
+    exit 1
+  fi
+}
+
+check_ollama() {
+  if ! command -v ollama &>/dev/null; then
+    echo "ollama not found"
+    exit 1
+  fi
+  if ! ollama list &>/dev/null 2>&1; then
+    echo "ollama not responding — is it running?"
+    exit 1
+  fi
+}
+
+get_sessions() {
+  if [[ -n "$TARGET_SESSION" ]]; then
+    if ! tmux has-session -t "$TARGET_SESSION" 2>/dev/null; then
+      echo "Session not found: $TARGET_SESSION"
+      exit 1
+    fi
+    echo "$TARGET_SESSION"
+  else
+    tmux list-sessions -F '#{session_name}' 2>/dev/null
+  fi
+}
+
+get_session_context() {
+  local session="$1"
+  local lines="${2:-50}"
+  local cwd git_branch pane_content
+
+  cwd=$(tmux display-message -t "$session" -p '#{pane_current_path}' 2>/dev/null || echo "unknown")
+  git_branch=$(git -C "$cwd" branch --show-current 2>/dev/null || echo "")
+  pane_content=$(tmux capture-pane -t "$session" -p -S "-$lines" 2>/dev/null || echo "")
+
+  echo "Working directory: $cwd"
+  [[ -n "$git_branch" ]] && echo "Git branch: $git_branch"
+  echo ""
+  echo "Recent terminal output:"
+  echo "$pane_content"
+}
+
+# ── usage ────────────────────────────────────────────────────────────────────
+
+usage() {
+  cat <<EOF
+Usage: tmux-tools <command> [options] [session-name]
+
+Commands:
+  name        Rename sessions with AI-generated descriptive names
+  summarize   Summarize what each session is doing
+  kill        Kill one or more sessions
+  list        List sessions with current names
+
+Options:
+  -d, --dry-run        (name) Show proposed names without renaming
+  -s, --skip-attached  Skip the currently attached session
+  -m, --model MODEL    Ollama model to use (default: gemma3:12b)
+  -h, --help           Show this help
+
+Examples:
+  tmux-tools name                   # rename all sessions
+  tmux-tools name -d                # preview names without renaming
+  tmux-tools name my-session        # rename one session
+  tmux-tools summarize              # summarize all sessions
+  tmux-tools summarize my-session   # summarize one session
+  tmux-tools kill sess1 sess2       # kill specific sessions
+  tmux-tools list                   # list all sessions
+EOF
+  exit 0
+}
+
+# ── name command ─────────────────────────────────────────────────────────────
+
+generate_name() {
+  local context="$1"
+
+  local prompt="Based on the terminal session context below, generate a short descriptive name for this tmux session.
+
+Rules:
+- 2-4 words, kebab-case (e.g. \"saadbase-workout-api\" or \"homelab-deploy\" or \"harry-bot-debug\")
+- Focus on WHAT project/task, not generic terms
+- Use the project/directory name as the base
+- Add a verb or qualifier only if the activity is clear (e.g. -debug, -test, -deploy, -refactor)
+- If it looks like a Claude Code / AI coding session, include what it's working on
+- Output ONLY the name, nothing else
+
+Context:
+$context"
+
+  local result
+  result=$(ollama run "$MODEL" "$prompt" 2>/dev/null | tr -d '[:space:]' | head -c 50)
+  result=$(echo "$result" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]//g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//')
+
+  if [[ -z "$result" ]]; then
+    echo ""
+    return 1
+  fi
+  echo "$result"
+}
+
+cmd_name() {
+  check_tmux
+  check_ollama
+
+  mapfile -t sessions < <(get_sessions)
+  if [[ ${#sessions[@]} -eq 0 ]]; then
+    echo "No tmux sessions found"
+    exit 0
+  fi
+
+  local attached_session
+  attached_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
+
+  [[ "$DRY_RUN" == true ]] && echo "DRY RUN — no sessions will be renamed"
+  echo ""
+  echo "Naming ${#sessions[@]} session(s) using $MODEL..."
+  echo ""
+
+  for session in "${sessions[@]}"; do
+    if [[ "$SKIP_ATTACHED" == true && "$session" == "$attached_session" ]]; then
+      printf "  %-35s   (skipped — attached)\n" "$session"
+      continue
+    fi
+
+    local context new_name
+    context=$(get_session_context "$session" 30)
+    new_name=$(generate_name "$context") || true
+
+    if [[ -z "$new_name" ]]; then
+      printf "  %-35s   (couldn't generate name)\n" "$session"
+      continue
+    fi
+
+    # Dedupe if name taken
+    if tmux has-session -t "$new_name" 2>/dev/null; then
+      new_name="${new_name}-$(echo "$session" | md5sum | head -c 4)"
+    fi
+
+    if [[ "$DRY_RUN" == true ]]; then
+      printf "  %-35s → %s\n" "$session" "$new_name"
+    else
+      tmux rename-session -t "$session" "$new_name" 2>/dev/null
+      printf "  %-35s → %s\n" "$session" "$new_name"
+    fi
+  done
+
+  echo ""
+  [[ "$DRY_RUN" == true ]] && echo "Run without -d to apply."
+  echo "Done."
+}
+
+# ── summarize command ────────────────────────────────────────────────────────
+
+generate_summary() {
+  local session="$1"
+  local context="$2"
+
+  local prompt="Based on the terminal session context below, write a brief summary of what this tmux session is doing.
+
+Rules:
+- 1-2 sentences max
+- Focus on: what project, what task/activity, current status (done, in progress, idle, waiting, errored)
+- If it's a Claude Code / AI coding session, summarize what it was working on and whether it finished
+- If there are actionable next steps visible, mention them
+- Be specific — project names, file names, error messages
+- Output ONLY the summary, no labels or prefixes
+
+Session name: $session
+
+Context:
+$context"
+
+  ollama run "$MODEL" "$prompt" 2>/dev/null
+}
+
+cmd_summarize() {
+  check_tmux
+  check_ollama
+
+  mapfile -t sessions < <(get_sessions)
+  if [[ ${#sessions[@]} -eq 0 ]]; then
+    echo "No tmux sessions found"
+    exit 0
+  fi
+
+  local attached_session
+  attached_session=$(tmux display-message -p '#{session_name}' 2>/dev/null || echo "")
+
+  echo ""
+  echo "Summarizing ${#sessions[@]} session(s) using $MODEL..."
+  echo ""
+
+  for session in "${sessions[@]}"; do
+    if [[ "$SKIP_ATTACHED" == true && "$session" == "$attached_session" ]]; then
+      continue
+    fi
+
+    local context summary
+    context=$(get_session_context "$session" 50)
+    summary=$(generate_summary "$session" "$context") || true
+
+    if [[ -z "$summary" ]]; then
+      printf "%-30s  (couldn't summarize)\n" "$session"
+    else
+      printf "\033[1m%-30s\033[0m\n" "$session"
+      printf "  %s\n\n" "$summary"
+    fi
+  done
+
+  echo "Done."
+}
+
+# ── kill command ─────────────────────────────────────────────────────────────
+
+cmd_kill() {
+  check_tmux
+
+  if [[ $# -eq 0 ]]; then
+    echo "Usage: tmux-tools kill <session> [session...]"
+    exit 1
+  fi
+
+  for session in "$@"; do
+    if tmux has-session -t "$session" 2>/dev/null; then
+      tmux kill-session -t "$session"
+      echo "  killed $session"
+    else
+      echo "  $session — not found"
+    fi
+  done
+}
+
+# ── list command ─────────────────────────────────────────────────────────────
+
+cmd_list() {
+  check_tmux
+  tmux list-sessions 2>/dev/null || echo "No tmux sessions"
+}
+
+# ── main ─────────────────────────────────────────────────────────────────────
+
+if [[ $# -eq 0 ]]; then
+  usage
+fi
+
+case "$1" in
+  -h|--help) usage ;;
+esac
+
+COMMAND="$1"
+shift
+
+# Parse remaining flags
+KILL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -d|--dry-run) DRY_RUN=true; shift ;;
+    -s|--skip-attached) SKIP_ATTACHED=true; shift ;;
+    -m|--model) MODEL="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    -*)
+      if [[ "$COMMAND" == "kill" ]]; then
+        KILL_ARGS+=("$1"); shift
+      else
+        echo "Unknown option: $1"; exit 1
+      fi
+      ;;
+    *)
+      if [[ "$COMMAND" == "kill" ]]; then
+        KILL_ARGS+=("$1")
+      else
+        TARGET_SESSION="$1"
+      fi
+      shift
+      ;;
+  esac
+done
+
+case "$COMMAND" in
+  name|n)       cmd_name ;;
+  summarize|s)  cmd_summarize ;;
+  kill|k)       cmd_kill "${KILL_ARGS[@]}" ;;
+  list|l|ls)    cmd_list ;;
+  *)            echo "Unknown command: $COMMAND"; echo ""; usage ;;
+esac
